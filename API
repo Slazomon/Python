@@ -1,0 +1,458 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+"""This script connects to Crodstrike api, and outputs a csv file with custom information
+"""
+import requests
+import json
+import re
+import csv
+import configparser
+import gzip
+import zipfile
+import smtplib
+from datetime import datetime
+from oauthlib.oauth2 import BackendApplicationClient
+from requests_oauthlib import OAuth2Session
+from pathlib import Path
+from email import encoders
+from email.header import Header
+from email.message import Message
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+def get_config_file():
+    """
+    Function to read the configuration file
+    Returns:
+    -------
+    A variable with configuration file
+    """
+    conf_file = "Configs.ini"
+    return(conf_file)
+
+def get_config_variables(conf_file):
+    """
+    Function that reads config values from .ini config file and parse it
+    Parameters:
+    ----------
+    conf_file : Configuration file, by default "Configs.ini"
+    Returns:
+    -------
+    Values parsed from .ini
+    """
+    config = configparser.ConfigParser()
+    config.sections()
+    config.read(conf_file)
+    return(config)
+
+def get_proxy_configuration(conf_file):
+    """
+    Function that reads proxy configuration only if it's defined.
+    Parameters:
+    ----------
+    conf_file : Configuration file, by default "Configs.ini"
+    Returns:
+    -------
+    A dictionary with proxies values,if are defined in the configuration file.
+    """
+    config_proxy_file = get_config_file()
+    proxy_settings = get_config_variables(conf_file)['PROXY']['Url']
+    if str(proxy_settings):
+        proxies = {"http" : str(proxy_settings),
+                   "https" : str(proxy_settings)
+                  }
+        return(proxies)
+
+def get_output_file():
+    """
+    Function that reads ouputfile from configuration file
+    Returns:
+    -------
+    A string with the name of configuration file.
+    """
+    config_file = get_config_file()
+    csv_output = get_config_variables(config_file)['DEFAULT']['OutputFile']
+    return(csv_output)
+
+def rotate_file(output_file):
+    """
+    Function that check if outputfile already exist and rotate it.
+    Parameters:
+    ----------
+    conf_file : Configuration file, by default "Configs.ini"
+    """
+    current_date = datetime.now()
+    dt_string = current_date.strftime("%Y-%m-%d_%H_%M_%S")
+    output_file_path = Path(output_file)
+    if output_file_path.is_file():
+        print("Ouputfile already exist, compressing...")
+        renamed_file = f"{output_file_path.stem}_{dt_string}{output_file_path.suffix}"
+        output_file_path.rename(Path(output_file_path.parent, renamed_file))
+        compressed_file = renamed_file + ".gz"
+        print(compressed_file)
+        with open(renamed_file, 'rb') as f_in, gzip.open(compressed_file, 'wb') as f_out:
+            f_out.writelines(f_in)
+        print("Compresion OK")
+        renamed_file_path = Path(renamed_file)
+        print(renamed_file_path)
+        if renamed_file_path.is_file():
+            print("Renamed file still exist, so removing...")
+            renamed_file_path.unlink(missing_ok=True)
+
+
+def rotate_file_zip(output_file):
+    """
+    Function that check if outputfile already exist and rotate it. But it compress in
+    zip file instead of gzip
+    Parameters:
+    ----------
+    conf_file : Configuration file, by default "Configs.ini"
+    """
+    current_date = datetime.now()
+    dt_string = current_date.strftime("%Y-%m-%d_%H_%M_%S")
+    output_file_path = Path(output_file)
+    if output_file_path.is_file():
+        print("Ouputfile already exist, compressing...")
+        renamed_file = f"{output_file_path.stem}_{dt_string}{output_file_path.suffix}"
+        output_file_path.rename(Path(output_file_path.parent, renamed_file))
+        comp_file = renamed_file + ".zip"
+        with zipfile.ZipFile(comp_file, 'w') as myzipfile:
+            myzipfile.write(renamed_file)
+            print("Compresion OK")
+        renamed_file_path = Path(renamed_file)
+        print(renamed_file_path)
+        if renamed_file_path.is_file():
+            print("Renamed file still exist, so removing...")
+            renamed_file_path.unlink(missing_ok=True)
+            
+
+def get_access_headers():
+    """
+    Function that connect to API and get "access_token"
+    Returns:
+    -------
+    Headers with the access_token.
+    """
+    config_file = get_config_file()
+    url = get_config_variables(config_file)['API']['Url']
+    client_id = get_config_variables(config_file)['API']['ClientID']
+    client_secret = get_config_variables(config_file)['API']['ClientSecret']
+    limit = get_config_variables(config_file)['API']['Limit']
+    proxies = get_proxy_configuration(config_file)
+    token_url = url + "/oauth2/token"
+    client = BackendApplicationClient(client_id=client_id)
+    oauth = OAuth2Session(client=client)
+    token = oauth.fetch_token(token_url=token_url, client_id=client_id,
+            client_secret=client_secret, proxies=proxies)
+    headers = {'Authorization': 'Bearer ' + token.get("access_token")}
+    return(headers)
+
+def get_host_ids(headers):
+    """
+    Function that gets all the host ids located in the endpoint "/devices/queries/devices/v1"
+    
+    Parameters:
+    ----------
+    headers : access_token got by the function get_access_headers
+    Returns:
+    -------
+    A dictionary with the hosts_ids
+    """
+    config_file = get_config_file()
+    url = get_config_variables(config_file)['API']['Url']
+    limit = get_config_variables(config_file)['API']['Limit']
+    proxies = get_proxy_configuration(config_file)
+    offset = 0
+    hosts_ids = []
+    while True:
+        params = {'limit': get_config_variables(config_file)['API']['Limit'],
+                  'offset': offset}
+        servers_endpoint = url + ("/devices/queries/devices/v1?filter=product_type_desc:\'Server\'")
+        response = requests.get(servers_endpoint, headers=headers, proxies=proxies, params=params)
+        paginated_hosts = response.json()
+        offset = paginated_hosts['meta']['pagination']['offset']
+        total = paginated_hosts['meta']['pagination']['total']
+        for i in paginated_hosts['resources']:
+            hosts_ids.append(i)
+        if offset == total:
+            break
+    return(hosts_ids)
+
+def check_response_field(field,response_dict):
+    """
+    Function that check if a field exist in the response.
+    
+    Parameters:
+    ----------
+    field : value to check
+    response_dict : A dictionary with the response from the API
+    Returns:
+    -------
+    A string value or "No found" if the value is not found in the dictionary.
+    """
+    field = str(field)
+    if field in response_dict.keys():
+        value = response_dict[field]
+    else:
+        value = ("No %s found" % field)
+    return str(value)
+
+def calculate_inactivity(last_seen_date):
+    """
+    Function that calculate inactivity and check if the host must alert
+    based on the config_file "HoursToAlert" value. 
+    
+    Parameters:
+    ----------
+    last_seen_date : value got from the API.
+    Returns:
+    -------
+    A tuple with inactivity value in hours and a boolean value that inform if the asset must alert or not.
+    """
+    config_file = get_config_file()
+    treshold = get_config_variables(config_file)['ALERTS']['HoursToAlert']
+    treshold = int(treshold)
+    current_date = datetime.utcnow()
+    last_seen_epoch = datetime.strptime(last_seen_date, "%Y-%m-%d %H:%M:%S")
+    inactivity = current_date - last_seen_epoch
+    days, seconds = inactivity.days, inactivity.seconds
+    hours = days * 24 + seconds // 3600
+    if hours > treshold:
+        alert = 'True'
+    else:
+        alert = 'False'
+    return (str(hours),str(alert))
+
+def write_output_csv(file, csv_list):
+    """
+    Function that write the csv output
+    Parameters:
+    ----------
+    file : Output file defined in config_file
+    csv_list: Output from API
+    """
+    with open(file, "w",newline="") as csvfile:
+        csv_headers = ["sHOSTNAME","LOCAL_IP","MAC","Platform","OsType","OSVersion","OSBuildNum","CROWD_DeviceType",
+                   "CROWD_BuildNum","CROWD_AgentVersion","EXTERNAL_IP","CROWD_Domain","CROWD_Site",
+                   "CROWD_Status","CROWD_Manufacturer","CROWD_Model","CROWD_FirstSeen","dCROWD_LastSeen",
+                   "OU","Tags","MainTag","Prevention Policy", "Prevention Applied Date", "Sensor Update Policy",
+                   "Sensor Applied Date", "HostID","Inactive Since", "Alert", "Cloud service provider"]
+        writer = csv.writer(csvfile)
+        writer.writerow(csv_headers)
+        for i in csv_list:
+            for j in i:
+                writer.writerow(j)
+        print("Output file wrote. Script ends.")
+
+def get_ids(headers,endpoint):
+    """
+    Function that gets all the ids located in the endpoint received as an argument.
+    
+    Parameters:
+    ----------
+    headers : access_token got by the function get_access_headers
+    endpoint: The url endpoint with all the ids.
+    Returns:
+    -------
+    A list with the ids.
+    """
+    config_file = get_config_file()
+    url = get_config_variables(config_file)['API']['Url']
+    limit = get_config_variables(config_file)['API']['Limit']
+    proxies = get_proxy_configuration(config_file)
+    offset = 0
+    ids = []
+    while True:
+        params = {'limit': get_config_variables(config_file)['API']['Limit'],
+                  'offset': offset}
+        final_endpoint = url + endpoint
+        response = requests.get(final_endpoint, headers=headers, proxies=proxies, params=params)
+        paginated_ids = response.json()
+        offset = paginated_ids['meta']['pagination']['offset']
+        total = paginated_ids['meta']['pagination']['total']
+        for i in paginated_ids['resources']:
+            ids.append(i)
+        if offset == total:
+            break
+    return(ids)
+
+def get_policies_detail(headers,endpoint_ids,endpoint_details):
+    """
+    Gets the ids from "endpoint_ids" and brings the data from "endpoint_details"
+    
+    Parameters:
+    ----------
+    headers : access_token got by the function get_access_headers
+    endpoint_ids: The URL endpoint that contain all the ids from policies.
+    endpoint_details: The URL endpoint that contain all the details.
+    
+    Returns:
+    -------
+    A dictionary with the policies details.
+    """
+    config_file = get_config_file()
+    url = get_config_variables(config_file)['API']['Url']
+    proxies = get_proxy_configuration(config_file)
+    policies_ids = get_ids(headers,endpoint_ids)
+    params = {'ids': policies_ids}
+    policies_detail = url + endpoint_details
+    response = requests.get(policies_detail, headers=headers, proxies=proxies, params=params)
+    return response.json()['resources']
+
+def send_mail(output_file, body):
+    """
+    Send an email with the output file as attachment.
+    
+    Parameters:
+    ----------
+    output_file : the attachment file.
+    body: The email body
+    """
+    config_file = get_config_file()
+    smtp_host = get_config_variables(config_file)['SMTP']['Host']
+    smtp_port = get_config_variables(config_file)['SMTP']['Port']
+    subject = get_config_variables(config_file)['SMTP']['Subject']
+    src_email = get_config_variables(config_file)['SMTP']['From']
+    dst_emails = get_config_variables(config_file)['SMTP']['Recipients']
+    dst_email_list = dst_emails.split(',')
+    server = smtplib.SMTP(smtp_host, smtp_port)
+    c = MIMEMultipart()
+    c.add_header('Content-Type', 'text')
+    c['From'] = src_email
+    c['To'] = dst_emails
+    c['Subject'] = Header(subject, 'utf-8')
+    c.attach(MIMEText(body, 'plain'))
+    output_file_path = Path(output_file)
+    attachment = open(output_file_path, "rb")
+    part = MIMEBase('application', 'octet-stream')
+    part.set_payload((attachment).read())
+    encoders.encode_base64(part)
+    part.add_header('Content-Disposition',
+                    "attachment; filename= %s" % output_file)
+    c.attach(part)
+    try:
+        server.sendmail(src_email, dst_email_list, c.as_string())
+        server.quit()
+    except Exception as e:
+        print("type error: " + str(e))
+
+def split_list(alist):
+    config_file = get_config_file()
+    serverstoget = get_config_variables(config_file)['DEFAULT']['SplitServerNumber']
+    serverstoget = int(serverstoget)
+    length = len(alist)
+    wanted_parts = length // serverstoget
+    print("Getting %s hosts in %s calls to the API" % (length,wanted_parts))
+    return [ alist[i*length // wanted_parts: (i+1)*length // wanted_parts] 
+             for i in range(wanted_parts) ]
+
+def get_hostendpoint():
+    config_file = get_config_file()
+    serverstoget = get_config_variables(config_file)['API']['ServerType']
+    endpoint = "/devices/queries/devices/v1?filter="
+    
+    if serverstoget:
+        final_endpoint = endpoint + ""
+    else:
+        final_endpoint = endpoint + ""
+    return final_endpoint
+    
+
+def get_data(headers,hosts_ids):
+    """
+    This could be the main function.
+    
+    Returns:
+    -------
+    A list that is needed by "write_output_csv" to write in the csv.
+    """
+    config_file = get_config_file()
+    url = get_config_variables(config_file)['API']['Url']
+    proxies = get_proxy_configuration(config_file)
+    params = {'ids': hosts_ids}
+    device_endpoint = url + "/devices/entities/devices/v1"
+    version_regex = re.compile(".*?(\d+.*)")
+    csv_list = []
+    response_device = requests.get(device_endpoint, headers=headers, proxies=proxies, params=params)
+    prevention_policies = get_policies_detail(headers,
+                                              "/policy/queries/prevention/v1","/policy/entities/prevention/v1" )
+    sensor_update_policies = get_policies_detail(headers,
+                                                 "/policy/queries/sensor-update/v1","/policy/entities/sensor-update/v1")
+    for r in response_device.json()['resources']:
+        
+        if "device_policies" in r.keys():
+            crowd_response_json = r['device_policies']
+        else:
+            crowd_response_json = "No device_policies found"
+        hostname = check_response_field('hostname',r)
+        local_ip = str(check_response_field('local_ip',r))
+        mac = str(check_response_field("mac_address",r))
+        platform = str(r['platform_name'])
+        #ostype = str(r['os_version'])
+        ostype = str(check_response_field('os_version',r))
+        version = version_regex.match(ostype)
+        if version:
+            osversion = str(version.group(1))
+        else:
+            osversion = "No osversion specified"
+        osbuildnum = check_response_field("build_number",r)
+        cronwd_device_type = str(r['product_type_desc'])
+        crowd_buildnum = str(r['config_id_build'])
+        crowd_agent_version = str(r['agent_version'])
+        external_ip = str(check_response_field('external_ip',r))
+        crowd_domain = check_response_field("machine_domain",r)
+        crowd_site = check_response_field("site_name",r)
+        crowd_status = str(r['status'])
+        crowd_manufacturer = str(check_response_field('system_manufacturer',r))
+        crowd_manufacturer = crowd_manufacturer.replace(",","")
+        crowd_model = str(check_response_field('system_product_name',r))
+        crowd_model = crowd_model.replace(",","")
+        crowd_first_seen = str(check_response_field('first_seen',r))
+        crowd_first_seen = crowd_first_seen.replace("T"," ").replace("Z","")
+        crowd_last_seen = str(check_response_field('last_seen',r))
+        crowd_last_seen = crowd_last_seen.replace("T"," ").replace("Z","")
+        service_provider = str(check_response_field('service_provider',r))
+        #crowd_first_seen = str(r['first_seen'].replace("T"," ").replace("Z",""))
+        #crowd_last_seen = str(r['last_seen'].replace("T"," ").replace("Z",""))
+        ou = str(check_response_field("ou", r))
+        ou = ou.replace(",","|")
+        tags = str(check_response_field("tags",r))
+        tags = tags.replace(",","|").replace("[", "").replace("]","").replace("\'","")
+        maintag = tags.split("|")[0]
+        if crowd_response_json != "No device_policies found":
+            for i in prevention_policies:
+                if crowd_response_json['prevention']['policy_id'] in i['id']:
+                    prevention_policy = str(i['name'])
+                    prev_applied_date = str(crowd_response_json['prevention']['applied_date'])
+                    prev_applied_date = prev_applied_date.replace("T"," ").replace("Z","")
+                    prev_applied_date = prev_applied_date.split(".")[0]
+            for j in sensor_update_policies:
+                if crowd_response_json['sensor_update']['policy_id'] in j['id']:
+                    sensor_update_policy = str(j['name'])
+                    sens_applied_date = str(crowd_response_json['sensor_update']['applied_date'])
+                    sens_applied_date = sens_applied_date.replace("T"," ").replace("Z","")
+                    sens_applied_date = sens_applied_date.split(".")[0]
+        else:
+            prevention_policy, prev_applied_date = ("No policies applied", "N/A")
+            sensor_update_policy, sens_applied_date = ("No policies applied", "N/A")
+        host_id = str(r['device_id'])
+        inactive,alert = calculate_inactivity(crowd_last_seen)
+        csv_ouput = hostname + ',' + local_ip + ',' + mac + ',' + platform + ',' + ostype + ',' + osversion                     + ',' + osbuildnum + ',' +  cronwd_device_type + ',' + crowd_buildnum + ',' + crowd_agent_version                     + ',' + external_ip + ',' + crowd_domain + ',' +  crowd_site + ',' +  crowd_status                     + ',' +  crowd_manufacturer + ',' + crowd_model + ',' +  crowd_first_seen                     + ',' +  crowd_last_seen + ',' + ou + ',' + tags + ',' + maintag + ',' + prevention_policy                     + ',' + prev_applied_date + ',' +  sensor_update_policy                     + ',' + sens_applied_date + ',' +  host_id  + ',' + inactive + ',' + alert + ',' + service_provider
+        csv_list.append(csv_ouput.split(','))
+    return csv_list
+
+if __name__ == '__main__':
+    csv_output = get_output_file()
+    rotate_file_zip(csv_output)
+    headers = get_access_headers()
+    endpoint = get_hostendpoint()
+    hosts_ids = get_ids(headers,endpoint)
+    splited_hosts = split_list(hosts_ids)
+    my_csv_list = []
+    for s in splited_hosts:
+        my_csv_list.append(get_data(headers,s))
+    write_output_csv(csv_output,my_csv_list)
+    send_mail(csv_output,"CS export results")
+
